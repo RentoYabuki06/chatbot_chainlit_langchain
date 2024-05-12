@@ -180,3 +180,4 @@ submission/*
 !submission/sample_strategy.py
 
 outputs/*
+.env

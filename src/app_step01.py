@@ -1,72 +1,63 @@
-import os # osとやりとりするAPI, ここでは環境変数にopenAIのAPIキーを設定するため
-import shutil # 高レベルのファイルやディレクトリの操作。ここでは一時DBの削除に使用
-# from PyPDF2 import PdfReader 
+import json
+import ast
+import chainlit as cl
+import os
 from openai import AsyncOpenAI
 
-from langchain.chat_models import ChatOpenAI # チャット用のAIモデル
-from langchain.prompts import ChatPromptTemplate # プロンプトのテンプレート
-from langchain.schema import StrOutputParser #文字出力パーサー
-# Runnable（実行可能オブジェクト）とその設定に関するクラスをインポートします。
+from dotenv import load_dotenv
+
+from langchain.chat_models import ChatOpenAI
+from langchain.schema import StrOutputParser
 from langchain.schema.runnable import Runnable
 from langchain.schema.runnable.config import RunnableConfig
-# 環境変数の設定
-from dotenv import load_dotenv
-# chainlit（チャットボット作成用フレームワーク）をclとしてインポートします。
-import chainlit as cl
+from langchain.prompts.chat import (
+    ChatPromptTemplate,
+    SystemMessagePromptTemplate,
+    HumanMessagePromptTemplate,
+)
 
-TEMP_PDF_PATH = "./doc/doc.pdf"
 
-# 環境変数を`.env`ファイルから読み込む
+# 環境変数ファイルをロード
 load_dotenv()
 
-# 環境変数からAPIキーを取得
-api_key = os.getenv('OPENAI_API_KEY')
+# 環境変数から API キーを取得
+api_key = os.getenv("OPENAI_API_KEY")
 client = AsyncOpenAI(api_key=api_key)
 
-# PDFファイルを開いてテキストを抽出するための非同期関数
-async def process_pdf(file):
-    file = file[0] if isinstance(file, list) else file
-    with open(TEMP_PDF_PATH, 'wb') as f:
-        f.write(file.content)
-    reader = PdfReader(TEMP_PDF_PATH)
-    return ''.join(page.extract_text() for page in reader.pages)
-
-# チャットセッションが開始されたときに呼び出される関数を定義します。このデコレータが関数をイベントハンドラとして登録します。
-@cl.on_chat_start
-async def on_chat_start():
-    # ChatOpenAIモデルをストリーミングモードでインスタンス化します。
+# 初回起動時に呼び出されてチャットが開始する
+@cl.on_chat_start #デコレータ
+async def on_chat_start(): # 非同期関数
     model = ChatOpenAI(streaming=True)
-    # チャットプロンプトテンプレートを作成し、AIの役割を定義します。
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "Please provide appropriate responses to the questions.",
-            ),
-            ("human", "{question}"),
-        ]
-    )
-    # プロンプト、モデル、出力パーサーをつなげて実行可能なオブジェクトを作成します。
-    runnable = prompt | model | StrOutputParser()
-    # この実行可能オブジェクトをユーザーセッションに格納し、後で再利用できるようにします。
-    cl.user_session.set("runnable", runnable)
+    # システム用のメッセージプロンプトテンプレートの準備
+    template="You're an helpful assistant. You have to answer the question."
+    system_message_prompt = SystemMessagePromptTemplate.from_template(template)
 
+    #人間用のメッセージプロンプトテンプレートの準備
+    human_template="{question}"
+    human_message_prompt = HumanMessagePromptTemplate.from_template(human_template)
+
+    # プロンプトテンプレートの準備
+    prompt = ChatPromptTemplate.from_messages([system_message_prompt, human_message_prompt])
+    # コンポーネントの連結
+    message_history = prompt | model | StrOutputParser()
+    # 作成したオブジェクトをセッション変数"Conversation history"に保存する
+    cl.user_session.set("message_history", message_history)
+
+
+# ユーザーからのメッセージを受け取ったときに呼び出される関数
 @cl.on_message
-async def on_message(message: cl.Message):
-    # ユーザーセッションから実行可能オブジェクトを取得します。
-    runnable = cl.user_session.get("runnable")
-
-    # メッセージオブジェクトを作成し、初期コンテンツを空に設定します。
+async def on_message(message: cl.Message): # 非同期関数  cl.Messageタイプのmessageを受け取る
+    # 会話履歴を取り出す
+    message_history = cl.user_session.get("message_history")  
+    # 応答に利用するための空文字列を生成する
     msg = cl.Message(content="")
 
-    # 取得した実行可能オブジェクトを非同期に実行し、メッセージの内容を質問としてAIに渡します。
-    async for chunk in runnable.astream(
+
+    async for chunk in message_history.astream(
         {"question": message.content},
-        # 実行時の設定として、Langchainのコールバックハンドラを設定します。
         config=RunnableConfig(callbacks=[cl.LangchainCallbackHandler()]),
     ):
-        # AIからの応答チャンクをメッセージオブジェクトに追加します。
+    # 部分的なテキストデータをメッセージに追加する
         await msg.stream_token(chunk)
-
-    # 構築したメッセージをユーザーに送信します。
+    # 完全な解答をユーザーに送信する
     await msg.send()

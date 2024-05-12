@@ -1,63 +1,163 @@
-import json
-import ast
-import chainlit as cl
-import os
-from openai import AsyncOpenAI
+# Import necessary modules and define env variables
 
-from dotenv import load_dotenv
-
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import Chroma
+from langchain.chains import RetrievalQAWithSourcesChain
 from langchain.chat_models import ChatOpenAI
-from langchain.schema import StrOutputParser
-from langchain.schema.runnable import Runnable
-from langchain.schema.runnable.config import RunnableConfig
 from langchain.prompts.chat import (
     ChatPromptTemplate,
     SystemMessagePromptTemplate,
     HumanMessagePromptTemplate,
 )
+import os
+import io
+import chainlit as cl
+import PyPDF2
+from io import BytesIO
 
 
-# 環境変数ファイルをロード
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
 load_dotenv()
 
-# 環境変数から API キーを取得
-api_key = os.getenv("OPENAI_API_KEY")
-client = AsyncOpenAI(api_key=api_key)
-
-# 初回起動時に呼び出されてチャットが開始する
-@cl.on_chat_start #デコレータ
-async def on_chat_start(): # 非同期関数
-    model = ChatOpenAI(streaming=True)
-    # システム用のメッセージプロンプトテンプレートの準備
-    template="You're an helpful assistant. You have to answer the question."
-    system_message_prompt = SystemMessagePromptTemplate.from_template(template)
-
-    #人間用のメッセージプロンプトテンプレートの準備
-    human_template="{question}"
-    human_message_prompt = HumanMessagePromptTemplate.from_template(human_template)
-
-    # プロンプトテンプレートの準備
-    prompt = ChatPromptTemplate.from_messages([system_message_prompt, human_message_prompt])
-    # コンポーネントの連結
-    message_history = prompt | model | StrOutputParser()
-    # 作成したオブジェクトをセッション変数"Conversation history"に保存する
-    cl.user_session.set("message_history", message_history)
+OPENAI_API_KEY= os.getenv("OPENAI_API_KEY")
 
 
-# ユーザーからのメッセージを受け取ったときに呼び出される関数
-@cl.on_message
-async def on_message(message: cl.Message): # 非同期関数  cl.Messageタイプのmessageを受け取る
-    # 会話履歴を取り出す
-    message_history = cl.user_session.get("message_history")  
-    # 応答に利用するための空文字列を生成する
-    msg = cl.Message(content="")
+# text_splitter and system template
+
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+
+system_template = """Use the following pieces of context to answer the users question.
+If you don't know the answer, just say that you don't know, don't try to make up an answer.
+ALWAYS return a "SOURCES" part in your answer.
+The "SOURCES" part should be a reference to the source of the document from which you got your answer.
+
+Example of your response should be:
+
+```
+The answer is foo
+SOURCES: xyz
+```
+
+Begin!
+----------------
+{summaries}"""
 
 
-    async for chunk in message_history.astream(
-        {"question": message.content},
-        config=RunnableConfig(callbacks=[cl.LangchainCallbackHandler()]),
-    ):
-    # 部分的なテキストデータをメッセージに追加する
-        await msg.stream_token(chunk)
-    # 完全な解答をユーザーに送信する
+messages = [
+    SystemMessagePromptTemplate.from_template(system_template),
+    HumanMessagePromptTemplate.from_template("{question}"),
+]
+prompt = ChatPromptTemplate.from_messages(messages)
+chain_type_kwargs = {"prompt": prompt}
+
+
+@cl.on_chat_start
+async def on_chat_start():
+
+    # Sending an image with the local file path
+    elements = [
+    cl.Image(name="image1", display="inline", path="./robot.jpeg")
+    ]
+    await cl.Message(content="Hello there, Welcome to AskAnyQuery related to Data!", elements=elements).send()
+    files = None
+
+    # Wait for the user to upload a PDF file
+    while files is None:
+        files = await cl.AskFileMessage(
+            content="Please upload a PDF file to begin!",
+            accept=["application/pdf"],
+            max_size_mb=20,
+            timeout=180,
+        ).send()
+
+    file = files[0]
+
+    msg = cl.Message(content=f"Processing `{file.name}`...")
     await msg.send()
+
+    # Read the PDF file
+    pdf_stream = BytesIO(file.content)
+    pdf = PyPDF2.PdfReader(pdf_stream)
+    pdf_text = ""
+    for page in pdf.pages:
+        pdf_text += page.extract_text()
+
+    # Split the text into chunks
+    texts = text_splitter.split_text(pdf_text)
+
+    # Create metadata for each chunk
+    metadatas = [{"source": f"{i}-pl"} for i in range(len(texts))]
+
+    # Create a Chroma vector store
+    embeddings = OpenAIEmbeddings()
+    docsearch = await cl.make_async(Chroma.from_texts)(
+        texts, embeddings, metadatas=metadatas
+    )
+
+    # Create a chain that uses the Chroma vector store
+    chain = RetrievalQAWithSourcesChain.from_chain_type(
+        ChatOpenAI(temperature=0),
+        chain_type="stuff",
+        retriever=docsearch.as_retriever(),
+    )
+    
+
+    # Save the metadata and texts in the user session
+    cl.user_session.set("metadatas", metadatas)
+    cl.user_session.set("texts", texts)
+
+    # Let the user know that the system is ready
+    msg.content = f"Processing `{file.name}` done. You can now ask questions!"
+    await msg.update()
+
+    cl.user_session.set("chain", chain)
+
+
+@cl.on_message
+async def main(message:str):
+
+    chain = cl.user_session.get("chain")  # type: RetrievalQAWithSourcesChain
+    cb = cl.AsyncLangchainCallbackHandler(
+        stream_final_answer=True, answer_prefix_tokens=["FINAL", "ANSWER"]
+    )
+    cb.answer_reached = True
+    res = await chain.acall(message, callbacks=[cb])
+
+    answer = res["answer"]
+    sources = res["sources"].strip()
+    source_elements = []
+    
+    # Get the metadata and texts from the user session
+    metadatas = cl.user_session.get("metadatas")
+    all_sources = [m["source"] for m in metadatas]
+    texts = cl.user_session.get("texts")
+
+    if sources:
+        found_sources = []
+
+        # Add the sources to the message
+        for source in sources.split(","):
+            source_name = source.strip().replace(".", "")
+            # Get the index of the source
+            try:
+                index = all_sources.index(source_name)
+            except ValueError:
+                continue
+            text = texts[index]
+            found_sources.append(source_name)
+            # Create the text element referenced in the message
+            source_elements.append(cl.Text(content=text, name=source_name))
+
+        if found_sources:
+            answer += f"\nSources: {', '.join(found_sources)}"
+        else:
+            answer += "\nNo sources found"
+
+    if cb.has_streamed_final_answer:
+        cb.final_stream.elements = source_elements
+        await cb.final_stream.update()
+    else:
+        await cl.Message(content=answer, elements=source_elements).send()
